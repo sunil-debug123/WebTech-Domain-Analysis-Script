@@ -1,8 +1,9 @@
 import csv
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from webtech import WebTech
 from webtech.utils import ConnectionException, WrongContentTypeException
-from time import sleep
+from requests.exceptions import RequestException
 
 # Configure logging to display messages in the terminal and write to a file
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -10,10 +11,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Initialize WebTech instance
 wt = WebTech()
 wt.timeout = 6  # Set a default timeout value
-
-# Retry configuration
-max_retries = 3  # Maximum number of retries for transient errors
-retry_delay = 5  # Delay between retries in seconds
 
 # Function to extract detected technologies from the result
 def extract_detected_technologies(result):
@@ -28,58 +25,71 @@ def extract_detected_technologies(result):
         return ", ".join(technologies)  # Joining technologies with comma
     return ""
 
-# Function to process a chunk of domains
-def process_chunk(domains, start_index, csv_writer):
-    results = []
-    for idx, domain in enumerate(domains, start=start_index):
-        domain_with_https = f"https://{domain.strip()}"
-        for attempt in range(1, 4):  # Attempt up to 3 retries
-            try:
-                result = wt.start_from_url(domain_with_https)
-                technology_stack = extract_detected_technologies(result)
-                results.append({'Serial Number': idx, 'Domain': domain_with_https, 'Technology Stack': technology_stack})
-                logging.info(f"Processed domain: {domain_with_https}")
-                break  # Exit the loop on success
-            except ConnectionException as e:
-                logging.error(f"Attempt {attempt}: Connection error for domain {domain_with_https}: {e}")
-                if attempt < 3:
-                    sleep(5)  # Wait for 5 seconds before retrying
-                else:
-                    logging.error(f"Failed to process domain after 3 attempts: {domain_with_https}")
-            except WrongContentTypeException as e:
-                logging.error(f"Wrong content type for domain {domain_with_https}: {e}")
-                break  # Skip this domain on WrongContentTypeException
-    return results
+# Function to process a single domain
+def process_domain(serial_number, domain):
+    domain_with_https = f"https://{domain.strip()}"
+    try:
+        result = wt.start_from_url(domain_with_https)
+        technology_stack = extract_detected_technologies(result)
+        logging.info(f"Processed domain: {domain_with_https}")
+        return {'Serial Number': serial_number, 'Domain': domain_with_https, 'Technology Stack': technology_stack}
+    except ConnectionException as e:
+        logging.error(f"Connection error for domain {domain_with_https}: {e}")
+    except WrongContentTypeException as e:
+        logging.error(f"Wrong content type for domain {domain_with_https}: {e}")
+    except RequestException as e:
+        logging.error(f"Request error for domain {domain_with_https}: {e}")
+    # Default return for any exception handling case
+    return {'Serial Number': serial_number, 'Domain': domain_with_https, 'Technology Stack': 'Not Found'}
 
-# Function to export results to CSV
-def export_to_csv(results, csv_writer):
-    for result in results:
-        csv_writer.writerow(result)
+# Function to get the last processed domain from the CSV file
+def get_last_processed_domain(csv_file):
+    try:
+        with open(csv_file, 'r') as f:
+            reader = csv.DictReader(f)
+            last_row = None
+            for row in reader:
+                last_row = row
+            if last_row:
+                return last_row['Domain']
+    except FileNotFoundError:
+        # If the CSV file doesn't exist yet, return None
+        pass
+    return None
 
 # Main function
-def main(input_file, output_file, start_index, chunk_size=100):
+def main(input_file, output_file):
     with open(input_file, 'r') as f:
         domains = f.readlines()
 
     total_domains = len(domains)
     logging.info(f"Total domains to process: {total_domains}")
 
+    last_processed_domain = get_last_processed_domain(f"{output_file}.csv")
+    if last_processed_domain:
+        try:
+            start_index = domains.index(last_processed_domain + '\n') + 1
+        except ValueError:
+            # If the last processed domain is not found in the input file, start from the beginning
+            start_index = 0
+    else:
+        start_index = 0
+
     with open(f"{output_file}.csv", 'a', newline='') as csvfile:
         fieldnames = ['Serial Number', 'Domain', 'Technology Stack']
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        
-        if start_index == 0:
+
+        # If the file is empty, write the header
+        if csvfile.tell() == 0:
             writer.writeheader()
 
-        for i in range(start_index, total_domains, chunk_size):
-            chunk = domains[i:i + chunk_size]
-            logging.info(f"Processing chunk {i // chunk_size + 1}/{(total_domains - 1) // chunk_size + 1}")
+        with ThreadPoolExecutor() as executor:
+            results = executor.map(process_domain, range(start_index + 1, start_index + total_domains + 1), domains[start_index:])
+            for result in results:
+                writer.writerow(result)
 
-            results = process_chunk(chunk, start_index=i + 1, csv_writer=writer)
-            export_to_csv(results, csv_writer=writer)
-
-            remaining_domains = total_domains - (i + chunk_size)
-            logging.info(f"Remaining domains: {remaining_domains}")
+    # Log a message indicating that the script has finished
+    logging.info("Script finished.")
 
 if __name__ == "__main__":
-    main("Enter the File of the Domains Here...!!", "webtech_results", start_index=0)
+    main("Enter the File of the Domains Here...!!", "webtech_results")
